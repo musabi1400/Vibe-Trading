@@ -1,0 +1,138 @@
+# ---------------------------------------------------------------------------
+# Vibe-Trading — OPTIONAL public-domain variant of docker-compose.yml
+#
+# This file does NOT replace docker-compose.yml automatically. It only takes
+# effect once you deliberately switch to it — either by pointing Dokploy's
+# "Compose Path" at this file instead, or by copying its content over
+# docker-compose.yml yourself. Until then, the deployment stays exactly as
+# it is today: 127.0.0.1-only, no internet exposure.
+#
+# What this adds on top of the hardened docker-compose.yml, and why:
+#
+#  * Joins the external `dokploy-network` so Dokploy's Traefik (which the
+#    server's own /etc/dokploy/traefik/traefik.yml confines to that network,
+#    with the Docker provider's exposedByDefault: false) can even see this
+#    container. Without this, labels alone do nothing.
+#  * `traefik.enable=true` + a router on the `websecure` (:443) entrypoint,
+#    TLS via the `letsencrypt` resolver (confirmed present in this server's
+#    traefik.yml — the name is not a guess).
+#  * A second router on `web` (:80) that ONLY ever redirects to HTTPS. It
+#    never serves the app and never accepts Basic Auth over plaintext.
+#  * Basic Auth via Traefik's basicauth middleware. Dokploy's UI cannot
+#    manage this for Compose services yet (github.com/Dokploy/dokploy
+#    issue #4284, open at time of writing) — hence hand-written labels
+#    instead of the "Advanced -> Security" panel Dokploy Applications get.
+#  * VT_BASICAUTH must hold the OUTPUT of `htpasswd -nB admin` (a bcrypt
+#    hash: "admin:$2y$05$..."), never the plaintext password. Generate it
+#    with: htpasswd -nB admin   (Apache utils / apache2-utils package),
+#    then paste the whole "admin:$2y$..." line as the value of VT_BASICAUTH
+#    in Dokploy's Environment tab. Rotate by changing that value + redeploy.
+#  * API_AUTH_KEY stays mandatory as a second, independent layer. It only
+#    means anything because VIBE_TRADING_TRUST_DOCKER_LOOPBACK=0 below — if
+#    that were ever flipped back to 1, any request arriving through Traefik
+#    (which always looks like it came from the Docker gateway) would be
+#    treated as a trusted local client and skip API_AUTH_KEY entirely,
+#    leaving the whole agent open behind only Basic Auth. Do not change it.
+#  * Threat model change: with a real domain + valid cert, the hostname is
+#    published in public Certificate Transparency logs within minutes of
+#    issuance, so internet-wide scanners will find it — this is not a
+#    hypothetical, CT logs are public and continuously mirrored. Basic Auth
+#    is the only thing stopping a request at that point, so VT_BASICAUTH
+#    must be a long, unique password's hash, not something guessable.
+#  * Optional third layer (recommended if you have a static IP): uncomment
+#    the two ipallowlist-related lines below marked OPTIONAL, filling in
+#    your real IP/CIDR. That rejects non-matching source IPs before Traefik
+#    even asks for a Basic Auth password.
+# ---------------------------------------------------------------------------
+services:
+  vibe-trading:
+    build: .
+    ports:
+      - "127.0.0.1:8899:8899"
+    networks:
+      - default
+      - dokploy-network
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=dokploy-network
+
+      # --- HTTPS router: the only place the app is ever actually served ---
+      - traefik.http.routers.vibe-trading-secure.rule=Host(`${VT_DOMAIN}`)
+      - traefik.http.routers.vibe-trading-secure.entrypoints=websecure
+      - traefik.http.routers.vibe-trading-secure.tls=true
+      - traefik.http.routers.vibe-trading-secure.tls.certresolver=letsencrypt
+      - traefik.http.routers.vibe-trading-secure.service=vibe-trading-svc
+      - traefik.http.services.vibe-trading-svc.loadbalancer.server.port=8899
+      # Active by default: Basic Auth only. To add the IP allowlist too,
+      # uncomment the two OPTIONAL lines below AND change this line to:
+      #   traefik.http.routers.vibe-trading-secure.middlewares=vibe-trading-ipallow,vibe-trading-auth
+      - traefik.http.routers.vibe-trading-secure.middlewares=vibe-trading-auth
+
+      # --- HTTP router: redirect-to-HTTPS only, never serves the app or an auth prompt ---
+      - traefik.http.routers.vibe-trading-insecure.rule=Host(`${VT_DOMAIN}`)
+      - traefik.http.routers.vibe-trading-insecure.entrypoints=web
+      - traefik.http.routers.vibe-trading-insecure.middlewares=vibe-trading-redirect
+      - traefik.http.middlewares.vibe-trading-redirect.redirectscheme.scheme=https
+      - traefik.http.middlewares.vibe-trading-redirect.redirectscheme.permanent=true
+
+      # --- Basic Auth: VT_BASICAUTH = the full "user:$2y$..." line from `htpasswd -nB admin` ---
+      - traefik.http.middlewares.vibe-trading-auth.basicauth.users=${VT_BASICAUTH}
+
+      # --- OPTIONAL: static-IP allowlist, stacked in front of Basic Auth ---
+      # - traefik.http.middlewares.vibe-trading-ipallow.ipallowlist.sourcerange=YOUR.IP.ADDRESS/32
+      # (see instructions above the HTTPS router's middlewares line to wire this in)
+    environment:
+      - API_AUTH_KEY=${API_AUTH_KEY}
+      - LLM_PROVIDER=${LLM_PROVIDER}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - LLM_MODEL=${LLM_MODEL:-}
+      - TUSHARE_TOKEN=${TUSHARE_TOKEN:-}
+      - FMP_API_KEY=${FMP_API_KEY:-}
+      - FRED_API_KEY=${FRED_API_KEY:-}
+      # --- safety switches: do not change without reading deploy/README.md ---
+      - VIBE_TRADING_TRUST_DOCKER_LOOPBACK=0
+      - VIBE_TRADING_ENABLE_SHELL_TOOLS=0
+      - VIBE_TRADING_ENABLE_SCHEDULER=0
+    volumes:
+      - vibe-runs:/app/agent/runs
+      - vibe-sessions:/app/agent/sessions
+      - vibe-home:/home/vibe/.vibe-trading
+      - vibe-swarm-runs:/app/agent/.swarm/runs
+      - vibe-uploads:/app/agent/uploads
+    cap_drop:
+      - ALL
+    # Kept on purpose: src/core/runner.py drops to the unprivileged
+    # vibe-sandbox user before running LLM-generated backtest code.
+    cap_add:
+      - SETUID
+      - SETGID
+    security_opt:
+      - "no-new-privileges:true"
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /home/vibe/.cache
+      - /home/vibe/.config
+    mem_limit: 4g
+    cpus: 2
+    pids_limit: 512
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+networks:
+  dokploy-network:
+    external: true
+
+volumes:
+  vibe-runs:
+  vibe-sessions:
+  vibe-home:
+  vibe-swarm-runs:
+  vibe-uploads:
