@@ -1,85 +1,74 @@
+# ---------------------------------------------------------------------------
+# Vibe-Trading — REPLACE docker-compose.yml IN YOUR FORK WITH THIS FILE
+#
+# Why a fork and not Dokploy's "Raw" compose mode: Raw gives the compose file
+# no source tree, so `build: .` has nothing to build. The only prebuilt image,
+# ghcr.io/hkuds/vibe-trading:edge, was built 2026-06-08 — three months behind
+# the repo, and there is no :latest tag. So Dokploy must use the Git provider
+# against a repo you control, with the hardened compose committed inside it.
+#
+# Differences from upstream docker-compose.yml, and why:
+#  * TRUST_DOCKER_LOOPBACK forced to 0. Upstream sets 1; _is_local_client() in
+#    agent/src/api/security.py then treats anything arriving from the Docker
+#    gateway as local and SKIPS API_AUTH_KEY. Under Dokploy every request
+#    arrives that way, so 1 would mean an unauthenticated agent.
+#  * No env_file / no ./agent/.env bind mount — Dokploy writes UI variables to
+#    a .env beside this file, and ${VAR} interpolation below reads them.
+#    (Trade-off: the Web UI Settings page can no longer persist changes; set
+#    values in the Dokploy Environment tab and redeploy.)
+#  * Host bind mounts replaced by named volumes (Dokploy manages the host FS).
+#  * Port published on 127.0.0.1 only, and NO domain attached in Dokploy, so
+#    Traefik never routes it from the internet. Reach it by SSH tunnel.
+# All upstream hardening (read_only, cap_drop, no-new-privileges, limits) kept.
+# ---------------------------------------------------------------------------
 services:
   vibe-trading:
     build: .
     ports:
       - "127.0.0.1:8899:8899"
-    env_file:
-      - agent/.env
     environment:
-      - VIBE_TRADING_TRUST_DOCKER_LOOPBACK=1
-      - VIBE_TW_STOCK_DB=/data/tw-stock/latest.db
-      # Ollama runs on the host; from inside the container "localhost" is the
-      # container itself, so default to reaching the host via host.docker.internal.
-      # Override by exporting OLLAMA_BASE_URL (or setting it in a top-level .env)
-      # when Ollama runs elsewhere or on a different port.
-      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
-    extra_hosts:
-      # Maps host.docker.internal -> host gateway (needed on Linux; harmless on Docker Desktop).
-      # Requires Docker Engine >= 20.10 / Compose v2 (host-gateway support).
-      - "host.docker.internal:host-gateway"
+      - API_AUTH_KEY=${API_AUTH_KEY}
+      - LLM_PROVIDER=${LLM_PROVIDER}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - LLM_MODEL=${LLM_MODEL:-}
+      - TUSHARE_TOKEN=${TUSHARE_TOKEN:-}
+      - FMP_API_KEY=${FMP_API_KEY:-}
+      - FRED_API_KEY=${FRED_API_KEY:-}
+      # --- safety switches: do not change without reading deploy/README.md ---
+      - VIBE_TRADING_TRUST_DOCKER_LOOPBACK=0
+      - VIBE_TRADING_ENABLE_SHELL_TOOLS=0
+      - VIBE_TRADING_ENABLE_SCHEDULER=0
     volumes:
       - vibe-runs:/app/agent/runs
       - vibe-sessions:/app/agent/sessions
-      # User-level agent state: persistent memory, cross-session search index
-      # (sessions.db), user-created skills, shadow accounts, hypothesis
-      # registry, broker connector config, agent.json. Without this volume a
-      # rebuild/recreate wipes it all (#197).
       - vibe-home:/home/vibe/.vibe-trading
       - vibe-swarm-runs:/app/agent/.swarm/runs
       - vibe-uploads:/app/agent/uploads
-      # Persist Web-UI-driven agent/.env edits (_write_env_values in
-      # src/api/helpers.py writes to /app/agent/.env) across container recreation.
-      # env_file above still seeds the initial boot env from the same file.
-      - ./agent/.env:/app/agent/.env
-      # Published Taiwan stock snapshots, mounted read-only. The default host
-      # path stays OUTSIDE the checkout: no market data may ever land in the
-      # working tree. Compose does not expand "~" in volume paths, so this uses
-      # ${HOME}. Override VIBE_TW_STOCK_DATA_DIR in the root .env with another
-      # absolute path outside the repo.
-      - ${VIBE_TW_STOCK_DATA_DIR:-${HOME}/.vibe-trading/tw-stock}:/data/tw-stock:ro
-    # --- Runtime hardening (VT-007) ---
     cap_drop:
       - ALL
-    # SETUID/SETGID are kept on purpose: runner.py drops privilege to the
-    # unprivileged vibe-sandbox user for LLM-generated-code subprocesses, which
-    # needs setuid/setgid. They are granted from container start (not gained via
-    # escalation), so no-new-privileges below does not neutralize them.
+    # Kept on purpose: src/core/runner.py drops to the unprivileged
+    # vibe-sandbox user before running LLM-generated backtest code.
     cap_add:
       - SETUID
       - SETGID
     security_opt:
       - "no-new-privileges:true"
     read_only: true
-    # Writable scratch on the read-only rootfs. Named volumes above already
-    # cover agent/runs, agent/sessions, agent/uploads, agent/.swarm/runs and
-    # /home/vibe/.vibe-trading; these tmpfs mounts cover /tmp and the cache dirs
-    # matplotlib/fontconfig write to during PDF rendering.
     tmpfs:
       - /tmp
       - /home/vibe/.cache
       - /home/vibe/.config
-    # Bound a single runaway backtest. Generous self-hosted defaults; override
-    # in a compose override file for constrained hosts.
     mem_limit: 4g
     cpus: 2
     pids_limit: 512
     restart: unless-stopped
-
-  frontend:
-    image: node:22@sha256:5647be709086c696ff32edaaf1c70cd26d1da6ab2b39c32f3c7b4c4a31957e37  # node:22 digest resolved 2026-07-28
-    working_dir: /app
-    ports:
-      - "127.0.0.1:5899:5899"
-    volumes:
-      - ./frontend:/app
-    environment:
-      - VITE_API_URL=http://vibe-trading:8899
-    command: sh -c "npm install && npm run dev -- --host --port 5899"
-    profiles:
-      - frontend
-    depends_on:
-      vibe-trading:
-        condition: service_started
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
 volumes:
   vibe-runs:
